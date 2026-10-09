@@ -45,4 +45,11 @@ pre-commit:
     e2e-test:
       run: |
         git diff --cached --name-only --diff-filter=ACMR | grep -Eq '^(package/ego-browser/|skills/ego-browser/)' || exit 0
+        # ego lite is still macOS-first; skip when the CLI is unavailable locally.
+        if [ -z "${EGO_BROWSER_REAL_E2E_CLI:-}" ] \
+          && ! command -v ego-browser >/dev/null 2>&1 \
+          && [ ! -x "/Applications/ego lite.app/Contents/Frameworks/ego Framework.framework/Versions/Current/Helpers/ego-browser" ]; then
+          echo "⚠ skip e2e: ego-browser CLI not found (install Ego Lite or set EGO_BROWSER_REAL_E2E_CLI)"
+          exit 0
+        fi
         cd package/ego-browser && npm run e2e

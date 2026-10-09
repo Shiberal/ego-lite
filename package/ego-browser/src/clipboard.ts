@@ -117,9 +117,10 @@ function beginNativeClipboardTransaction(
 ): Promise<ClipboardTransaction> {
   if (platform === "darwin") return beginDarwinClipboardTransaction(input);
   if (platform === "win32") return beginWin32ClipboardTransaction(input);
+  if (platform === "linux") return beginLinuxClipboardTransaction(input);
   return Promise.reject(
     new Error(
-      "page.keyboard.paste requires macOS or Windows clipboard support; use page.keyboard.insertText() for plain text",
+      "page.keyboard.paste requires macOS, Windows, or Linux clipboard support; use page.keyboard.insertText() for plain text",
     ),
   );
 }
@@ -215,6 +216,38 @@ function windowsPowerShellPath(): string {
     "v1.0",
     "powershell.exe",
   );
+}
+
+/**
+ * Keep the original clipboard text (and HTML when available) inside a
+ * short-lived Python host. Prefers xclip on X11, then wl-clipboard on
+ * Wayland. Temporary HTML uses GTK's multi-target clipboard when needed so
+ * plain text stays pasteable alongside raw text/html (not Windows CF_HTML).
+ */
+function beginLinuxClipboardTransaction(
+  input: ClipboardInput,
+  spawnHost: SpawnClipboardHost = spawn,
+): Promise<ClipboardTransaction> {
+  const content = typeof input === "string" ? { text: input } : input;
+  const child = spawnHost(
+    process.env.EGO_BROWSER_PYTHON ?? "python3",
+    ["-c", LINUX_CLIPBOARD_HOST_COMMAND],
+    { stdio: ["pipe", "pipe", "pipe"] },
+  );
+  return startClipboardHost(child, {
+    platformName: "Linux",
+    sendContent(stdin) {
+      const text = Buffer.from(content.text, "utf8").toString("base64");
+      const html =
+        content.html === undefined
+          ? ""
+          : Buffer.from(content.html, "utf8").toString("base64");
+      stdin.write(`${text}\n${html}\n`);
+    },
+    signalRestore() {
+      child.stdin?.end("restore\n");
+    },
+  });
 }
 
 /**
@@ -667,9 +700,423 @@ const WIN32_CLIPBOARD_HOST_COMMAND = Buffer.from(
   "utf16le",
 ).toString("base64");
 
+// The host reads two base64 lines (UTF-8 text, then optional raw HTML),
+// reports `ready`, and restores after the next stdin line. X11 uses xclip
+// (and GTK for text+HTML); Wayland uses wl-copy/wl-paste.
+const LINUX_CLIPBOARD_HOST = String.raw`
+import base64
+import ctypes
+import ctypes.util
+import fcntl
+import json
+import os
+import select
+import shutil
+import subprocess
+import sys
+import time
+
+LOCK_PATH = "/tmp/ego-browser-clipboard.lock"
+
+
+def emit(state, message=None):
+    payload = {"state": state}
+    if message is not None:
+        payload["message"] = message
+    sys.stdout.write(json.dumps(payload, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+
+def fail(message):
+    emit("error", message)
+    sys.exit(1)
+
+
+def read_b64_line():
+    line = sys.stdin.readline()
+    if line == "":
+        fail("clipboard host closed before content arrived")
+    line = line.strip()
+    if not line:
+        return b""
+    return base64.b64decode(line)
+
+
+def acquire_lock(lock_fd):
+    deadline = time.time() + 5
+    while True:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if time.time() >= deadline:
+                fail("another ego-browser process is using the clipboard")
+            time.sleep(0.02)
+
+
+def choose_backend():
+    display = os.environ.get("DISPLAY")
+    wayland = os.environ.get("WAYLAND_DISPLAY")
+    if display and shutil.which("xclip"):
+        return "x11"
+    if wayland and shutil.which("wl-copy") and shutil.which("wl-paste"):
+        return "wayland"
+    if not display and not wayland:
+        fail("page.keyboard.paste on Linux requires DISPLAY (xclip) or WAYLAND_DISPLAY (wl-clipboard)")
+    if display:
+        fail("page.keyboard.paste on Linux requires xclip when DISPLAY is set")
+    fail("page.keyboard.paste on Linux requires wl-copy and wl-paste when WAYLAND_DISPLAY is set")
+
+
+def xclip_get(target):
+    # An unowned CLIPBOARD selection makes xclip block forever; bound it.
+    try:
+        result = subprocess.run(
+            ["xclip", "-selection", "clipboard", "-o", "-t", target],
+            capture_output=True,
+            timeout=1,
+        )
+    except subprocess.TimeoutExpired:
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout
+
+
+def xclip_targets():
+    raw = xclip_get("TARGETS")
+    if raw is None:
+        return set()
+    return {
+        line.decode("utf-8", "replace").strip()
+        for line in raw.splitlines()
+        if line.strip()
+    }
+
+
+def xclip_set(target, data):
+    # xclip often keeps running as the selection owner after reading stdin.
+    proc = subprocess.Popen(
+        ["xclip", "-selection", "clipboard", "-t", target],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    proc.stdin.write(data)
+    proc.stdin.close()
+    try:
+        proc.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        return
+    if proc.returncode != 0:
+        err = proc.stderr.read().decode("utf-8", "replace").strip()
+        raise RuntimeError(err or "xclip failed to set the clipboard")
+
+
+def xclip_clear():
+    xclip_set("UTF8_STRING", b"")
+
+
+def snapshot_x11():
+    targets = xclip_targets()
+    text = None
+    html = None
+    if "UTF8_STRING" in targets or "text/plain;charset=utf-8" in targets or "TEXT" in targets:
+        text = xclip_get("UTF8_STRING")
+        if text is None:
+            text = xclip_get("text/plain;charset=utf-8")
+        if text is None:
+            text = xclip_get("TEXT")
+    if "text/html" in targets:
+        html = xclip_get("text/html")
+    return {"text": text, "html": html}
+
+
+def restore_x11(saved):
+    if saved["text"] is None and saved["html"] is None:
+        xclip_clear()
+        return
+    if saved["text"] is not None:
+        xclip_set("UTF8_STRING", saved["text"])
+    if saved["html"] is not None:
+        # Best effort: xclip owns one target; prefer keeping plain text pasteable.
+        if saved["text"] is None:
+            xclip_set("text/html", saved["html"])
+
+
+def current_x11_text():
+    return xclip_get("UTF8_STRING") or xclip_get("text/plain;charset=utf-8") or xclip_get("TEXT")
+
+
+def wl_get(mime):
+    try:
+        result = subprocess.run(
+            ["wl-paste", "--no-newline", "-t", mime],
+            capture_output=True,
+            timeout=1,
+        )
+    except subprocess.TimeoutExpired:
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout
+
+
+def snapshot_wayland():
+    text = wl_get("text/plain;charset=utf-8")
+    if text is None:
+        text = wl_get("text/plain")
+    html = wl_get("text/html")
+    return {"text": text, "html": html}
+
+
+def wl_set(mime, data):
+    subprocess.run(
+        ["wl-copy", "--type", mime],
+        input=data,
+        check=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+
+def wl_clear():
+    subprocess.run(
+        ["wl-copy", "--clear"], check=False, capture_output=True, timeout=5
+    )
+
+
+def restore_wayland(saved):
+    if saved["text"] is None and saved["html"] is None:
+        wl_clear()
+        return
+    if saved["text"] is not None:
+        wl_set("text/plain;charset=utf-8", saved["text"])
+    elif saved["html"] is not None:
+        wl_set("text/html", saved["html"])
+
+
+def current_wayland_text():
+    return wl_get("text/plain;charset=utf-8") or wl_get("text/plain")
+
+
+class GtkClipboard:
+    TEXT_INFO = 1
+    HTML_INFO = 2
+
+    def __init__(self, text, html):
+        self.text = text
+        self.html = html
+        self.lost = False
+        self._load()
+        self._set()
+
+    def _load(self):
+        gtk_name = ctypes.util.find_library("gtk-3")
+        gdk_name = ctypes.util.find_library("gdk-3")
+        glib_name = ctypes.util.find_library("glib-2.0")
+        if not gtk_name or not gdk_name or not glib_name:
+            raise RuntimeError("libgtk-3 is unavailable for multi-format clipboard")
+        self.gtk = ctypes.CDLL(gtk_name)
+        self.gdk = ctypes.CDLL(gdk_name)
+        self.glib = ctypes.CDLL(glib_name)
+        self.gtk.gtk_init(None, None)
+        self.gdk.gdk_atom_intern.restype = ctypes.c_void_p
+        self.gdk.gdk_atom_intern.argtypes = [ctypes.c_char_p, ctypes.c_int]
+        clipboard_atom = self.gdk.gdk_atom_intern(b"CLIPBOARD", 0)
+        self.gtk.gtk_clipboard_get.restype = ctypes.c_void_p
+        self.gtk.gtk_clipboard_get.argtypes = [ctypes.c_void_p]
+        self.clipboard = self.gtk.gtk_clipboard_get(clipboard_atom)
+
+        class GtkTargetEntry(ctypes.Structure):
+            _fields_ = [
+                ("target", ctypes.c_char_p),
+                ("flags", ctypes.c_uint),
+                ("info", ctypes.c_uint),
+            ]
+
+        self.GtkTargetEntry = GtkTargetEntry
+        GetFunc = ctypes.CFUNCTYPE(
+            None, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p
+        )
+        ClearFunc = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_void_p)
+
+        @GetFunc
+        def on_get(clipboard, selection_data, info, user_data):
+            if info == self.TEXT_INFO:
+                self.gtk.gtk_selection_data_set_text.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_char_p,
+                    ctypes.c_int,
+                ]
+                self.gtk.gtk_selection_data_set_text(
+                    selection_data, self.text, len(self.text)
+                )
+            elif info == self.HTML_INFO and self.html is not None:
+                self.gtk.gtk_selection_data_set.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_void_p,
+                    ctypes.c_int,
+                    ctypes.c_void_p,
+                    ctypes.c_int,
+                ]
+                atom = self.gdk.gdk_atom_intern(b"text/html", 0)
+                buf = ctypes.create_string_buffer(self.html)
+                self.gtk.gtk_selection_data_set(
+                    selection_data, atom, 8, buf, len(self.html)
+                )
+
+        @ClearFunc
+        def on_clear(clipboard, user_data):
+            self.lost = True
+
+        self._on_get = on_get
+        self._on_clear = on_clear
+        entries = [
+            GtkTargetEntry(b"UTF8_STRING", 0, self.TEXT_INFO),
+            GtkTargetEntry(b"text/plain;charset=utf-8", 0, self.TEXT_INFO),
+            GtkTargetEntry(b"TEXT", 0, self.TEXT_INFO),
+        ]
+        if self.html is not None:
+            entries.append(GtkTargetEntry(b"text/html", 0, self.HTML_INFO))
+        self._targets = (GtkTargetEntry * len(entries))(*entries)
+        self.gtk.gtk_clipboard_set_with_data.restype = ctypes.c_int
+        self.gtk.gtk_clipboard_set_with_data.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(GtkTargetEntry),
+            ctypes.c_uint,
+            GetFunc,
+            ClearFunc,
+            ctypes.c_void_p,
+        ]
+        self.glib.g_main_context_default.restype = ctypes.c_void_p
+        self._ctx = self.glib.g_main_context_default()
+        self.glib.g_main_context_iteration.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        self.glib.g_main_context_iteration.restype = ctypes.c_int
+
+    def _set(self):
+        ok = self.gtk.gtk_clipboard_set_with_data(
+            self.clipboard,
+            self._targets,
+            len(self._targets),
+            self._on_get,
+            self._on_clear,
+            None,
+        )
+        if not ok:
+            raise RuntimeError("gtk_clipboard_set_with_data failed")
+        for _ in range(10):
+            self.glib.g_main_context_iteration(self._ctx, 0)
+
+    def wait_for_restore(self):
+        while True:
+            self.glib.g_main_context_iteration(self._ctx, 0)
+            ready, _, _ = select.select([sys.stdin], [], [], 0.05)
+            if ready:
+                line = sys.stdin.readline()
+                if line == "" or line.strip() == "restore":
+                    return
+            if self.lost:
+                # Keep pumping until the parent asks to finish.
+                continue
+
+
+def wait_for_restore_line():
+    while True:
+        line = sys.stdin.readline()
+        if line == "" or line.strip() == "restore":
+            return
+
+
+def publish_temporary(backend, text, html):
+    if html:
+        try:
+            holder = GtkClipboard(text, html)
+            return ("gtk", holder, text)
+        except Exception:
+            # Plain text must still work when multi-format setup fails.
+            pass
+    if backend == "x11":
+        xclip_set("UTF8_STRING", text)
+        return ("x11", None, text)
+    wl_set("text/plain;charset=utf-8", text)
+    return ("wayland", None, text)
+
+
+def main():
+    backend = choose_backend()
+    text = read_b64_line()
+    html_raw = read_b64_line()
+    html = html_raw if html_raw else None
+
+    lock_fd = open(LOCK_PATH, "a+")
+    try:
+        acquire_lock(lock_fd)
+        saved = snapshot_x11() if backend == "x11" else snapshot_wayland()
+        try:
+            kind, holder, expected = publish_temporary(backend, text, html)
+        except Exception as error:
+            try:
+                if backend == "x11":
+                    restore_x11(saved)
+                else:
+                    restore_wayland(saved)
+            except Exception:
+                pass
+            fail(str(error))
+
+        emit("ready")
+        try:
+            if kind == "gtk":
+                holder.wait_for_restore()
+                changed = holder.lost
+            else:
+                wait_for_restore_line()
+                current = current_x11_text() if backend == "x11" else current_wayland_text()
+                changed = current != expected
+
+            if changed:
+                emit("changed")
+            else:
+                if backend == "x11":
+                    restore_x11(saved)
+                else:
+                    restore_wayland(saved)
+                emit("restored")
+        except Exception as error:
+            emit("error", str(error))
+            sys.exit(1)
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        except Exception:
+            pass
+        lock_fd.close()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception as error:
+        try:
+            emit("error", str(error))
+        except Exception:
+            pass
+        sys.exit(1)
+`;
+
+const LINUX_CLIPBOARD_HOST_COMMAND = `exec(__import__('base64').b64decode('${Buffer.from(
+  LINUX_CLIPBOARD_HOST,
+  "utf8",
+).toString("base64")}').decode())`;
+
 export const __testing = {
   beginNativeClipboardTransaction,
   beginWin32ClipboardTransaction,
+  beginLinuxClipboardTransaction,
   windowsHtmlClipboardFormat,
   WIN32_CLIPBOARD_HOST,
+  LINUX_CLIPBOARD_HOST,
 };

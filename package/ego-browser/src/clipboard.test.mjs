@@ -173,8 +173,8 @@ test("clipboard transactions are serialized within one runtime", async () => {
 
 test("paste explains the supported clipboard platforms", async () => {
   await assert.rejects(
-    () => __testing.beginNativeClipboardTransaction("temporary", "linux"),
-    /requires macOS or Windows clipboard support.*insertText/,
+    () => __testing.beginNativeClipboardTransaction("temporary", "freebsd"),
+    /requires macOS, Windows, or Linux clipboard support.*insertText/,
   );
 });
 
@@ -311,4 +311,113 @@ test("Windows clipboard restore errors keep the host's message", async () => {
   );
 
   await assert.rejects(() => transaction.finish(), /OpenClipboard failed/);
+});
+
+function fakeLinuxClipboardHost(respond) {
+  const child = new EventEmitter();
+  child.stdin = new PassThrough();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  const spawned = {};
+  const lines = [];
+  let pending = "";
+  child.stdin.setEncoding("utf8");
+  child.stdin.on("data", (chunk) => {
+    pending += chunk;
+    let newline;
+    while ((newline = pending.indexOf("\n")) >= 0) {
+      lines.push(pending.slice(0, newline));
+      pending = pending.slice(newline + 1);
+      respond(lines, (message) =>
+        child.stdout.write(`${JSON.stringify(message)}\n`),
+      );
+    }
+  });
+  child.stdin.on("finish", () => {
+    child.stdout.end();
+    setImmediate(() => child.emit("exit", spawned.exitCode ?? 0, null));
+  });
+  const spawnHost = (command, args, options) => {
+    Object.assign(spawned, { command, args, options });
+    return child;
+  };
+  return { spawnHost, spawned, lines };
+}
+
+test("Linux clipboard host receives text and raw HTML, then restores on signal", async () => {
+  const host = fakeLinuxClipboardHost((lines, emit) => {
+    if (lines.length === 2) emit({ state: "ready" });
+    if (lines.length === 3) emit({ state: "restored" });
+  });
+  const transaction = await __testing.beginLinuxClipboardTransaction(
+    { text: "A\t世界", html: "<td>A</td>" },
+    host.spawnHost,
+  );
+
+  assert.match(host.spawned.command, /python3$/);
+  assert.equal(host.spawned.args[0], "-c");
+  assert.equal(
+    Buffer.from(
+      host.spawned.args[1].match(/b64decode\('([^']+)'\)/)[1],
+      "base64",
+    ).toString("utf8"),
+    __testing.LINUX_CLIPBOARD_HOST,
+  );
+  assert.equal(
+    Buffer.from(host.lines[0], "base64").toString("utf8"),
+    "A\t世界",
+  );
+  assert.equal(
+    Buffer.from(host.lines[1], "base64").toString("utf8"),
+    "<td>A</td>",
+  );
+
+  assert.equal(await transaction.finish(), "restored");
+  assert.equal(host.lines.length, 3);
+});
+
+test("Linux clipboard host sends an empty HTML line for plain text", async () => {
+  const host = fakeLinuxClipboardHost((lines, emit) => {
+    if (lines.length === 2) emit({ state: "ready" });
+    if (lines.length === 3) emit({ state: "changed" });
+  });
+  const transaction = await __testing.beginLinuxClipboardTransaction(
+    "plain",
+    host.spawnHost,
+  );
+
+  assert.equal(host.lines[1], "");
+  assert.equal(await transaction.finish(), "changed");
+});
+
+test("Linux clipboard host errors keep the host's message", async () => {
+  const host = fakeLinuxClipboardHost((lines, emit) => {
+    if (lines.length === 2) {
+      emit({
+        state: "error",
+        message: "another ego-browser process is using the clipboard",
+      });
+    }
+  });
+
+  await assert.rejects(
+    () => __testing.beginLinuxClipboardTransaction("plain", host.spawnHost),
+    /another ego-browser process is using the clipboard/,
+  );
+});
+
+test("Linux clipboard restore errors keep the host's message", async () => {
+  const host = fakeLinuxClipboardHost((lines, emit) => {
+    if (lines.length === 2) emit({ state: "ready" });
+    if (lines.length === 3) {
+      host.spawned.exitCode = 1;
+      emit({ state: "error", message: "xclip failed" });
+    }
+  });
+  const transaction = await __testing.beginLinuxClipboardTransaction(
+    "plain",
+    host.spawnHost,
+  );
+
+  await assert.rejects(() => transaction.finish(), /xclip failed/);
 });
